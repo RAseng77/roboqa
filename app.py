@@ -1,185 +1,104 @@
 """
-6주차 실습: HuggingFace Space 칼로리 카운터 (LangChain LCEL 버전)
-================================================================
-음식 사진을 업로드하면
-  1) HF Inference API의 이미지 분류 모델로 음식을 인식하고
-  2) 그 결과를 LangChain ChatHuggingFace LLM에 넘겨 칼로리/영양소를 추정한 뒤
-  3) Gradio UI로 보여준다.
-
-핵심 변경: estimate_calories는 LCEL 체인(prompt | llm | parser)으로 구성한다.
-이 파일을 그대로 HuggingFace Space(Gradio SDK)에 올리면 배포된다.
-
-로컬 실행:
-    uv run python 00_for_me/src/week06/app.py
+RoboQA — 로보틱스 논문 QA 챗봇
+================================
+Gemini API로 로보틱스·VLA 논문 개념을 쉽게 풀어주는 QA 챗봇.
+트랙 A: LLM API 챗봇 | HF Spaces (Docker 모드) 배포
 """
 
-from __future__ import annotations
-
-import json
 import os
-import tempfile
-from typing import Any
-
 import gradio as gr
-from gradio_client import utils as _gc_utils  # noqa: E402
+import google.generativeai as genai
 
-# --- workaround: gradio_client의 JSON Schema walker가 bool 스키마를 만나면
-# 터지는 버그(#10178) 우회. Label/JSON 컴포넌트가 생성하는
-# additionalProperties: true 스키마에서 발생한다.
-_orig_get_type = _gc_utils.get_type
-def _safe_get_type(schema):
-    if isinstance(schema, bool):
-        return "Any"
-    return _orig_get_type(schema)
-_gc_utils.get_type = _safe_get_type
-
-_orig_j2p = _gc_utils._json_schema_to_python_type
-def _safe_j2p(schema, defs=None):
-    if isinstance(schema, bool):
-        return "Any"
-    return _orig_j2p(schema, defs)
-_gc_utils._json_schema_to_python_type = _safe_j2p
-
-from dotenv import load_dotenv
-from huggingface_hub import InferenceClient
-from langchain_core.output_parsers import JsonOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
-from PIL import Image
-
-from model_config import LLM_MODEL, VISION_MODEL, get_token
-
-load_dotenv()
-
-TOP_K = 3
-SYSTEM_PROMPT = (
-    "너는 영양사 AI다. 사용자는 음식 이미지 분류기의 top-k 결과(label, score)를 줄 것이다.\n"
-    "가장 가능성 높은 음식 1인분 기준으로 칼로리(kcal)와 주요 영양소(탄수화물/단백질/지방, g)를 추정하라.\n"
-    "추정이 불확실하면 그 사실을 'note' 필드에 명시하라.\n"
-    "반드시 아래 JSON 스키마만 출력하고 다른 텍스트/마크다운/코드블록 금지.\n"
-    '{{"food": str, "confidence": float, "calories_kcal": int, '
-    '"carbs_g": int, "protein_g": int, "fat_g": int, "note": str}}'
-)
-
-
-# -----------------------------------------------------------------------------
-# 클라이언트 / 체인 lazy init
-# -----------------------------------------------------------------------------
-_vision_client: InferenceClient | None = None
-_chain = None
-
-
-def _vision_lazy() -> InferenceClient:
-    global _vision_client
-    if _vision_client is None:
-        _vision_client = InferenceClient(token=get_token())
-    return _vision_client
-
-
-def _chain_lazy():
-    """LCEL 체인: prompt | ChatHuggingFace | JsonOutputParser"""
-    global _chain
-    if _chain is None:
-        endpoint = HuggingFaceEndpoint(
-            repo_id=LLM_MODEL,
-            task="text-generation",
-            max_new_tokens=300,
-            temperature=0.2,
-            huggingfacehub_api_token=get_token(),
-        )
-        llm = ChatHuggingFace(llm=endpoint)
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                ("system", SYSTEM_PROMPT),
-                ("human", "다음은 이미지 분류기의 top-k 결과다:\n{labels_json}"),
-            ]
-        )
-        _chain = prompt | llm | JsonOutputParser()
-    return _chain
-
-
-# -----------------------------------------------------------------------------
-# Step 1: 이미지 분류 (LangChain 추상화 없음 — InferenceClient 직접 사용)
-# -----------------------------------------------------------------------------
-def classify_food(image: Image.Image) -> list[dict[str, Any]]:
-    client = _vision_lazy()
-    # hf-inference 라우터가 Content-Type 헤더를 요구하므로
-    # 확장자가 있는 임시 파일 경로로 전달한다 (mimetype 자동 감지).
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
-        image.convert("RGB").save(tmp, format="JPEG")
-        tmp_path = tmp.name
-    try:
-        raw = client.image_classification(tmp_path, model=VISION_MODEL)
-    finally:
-        os.unlink(tmp_path)
-    results: list[dict[str, Any]] = []
-    for item in raw[:TOP_K]:
-        if isinstance(item, dict):
-            results.append({"label": item["label"], "score": float(item["score"])})
-        else:
-            results.append({"label": item.label, "score": float(item.score)})
-    return results
-
-
-# -----------------------------------------------------------------------------
-# Step 2: 칼로리/영양소 추정 (LCEL 체인)
-# -----------------------------------------------------------------------------
-def estimate_calories(labels: list[dict[str, Any]]) -> dict[str, Any]:
-    chain = _chain_lazy()
-    labels_json = json.dumps(labels, ensure_ascii=False)
-    try:
-        return chain.invoke({"labels_json": labels_json})
-    except Exception as e:
-        return {
-            "food": labels[0]["label"] if labels else "unknown",
-            "confidence": labels[0]["score"] if labels else 0.0,
-            "calories_kcal": 0,
-            "carbs_g": 0,
-            "protein_g": 0,
-            "fat_g": 0,
-            "note": f"체인 실행 실패: {type(e).__name__}: {str(e)[:120]}",
-        }
-
-
-# -----------------------------------------------------------------------------
-# Step 3: Gradio 콜백
-# -----------------------------------------------------------------------------
-def analyze(image):
-    if image is None:
-        return {}, {"error": "이미지를 먼저 업로드해 주세요."}
-    labels = classify_food(image)
-    label_view = {item["label"]: item["score"] for item in labels}
-    nutrition = estimate_calories(labels)
-    return label_view, nutrition
-
-
-# -----------------------------------------------------------------------------
-# Step 4: UI
-# -----------------------------------------------------------------------------
-def build_ui() -> gr.Interface:
-    return gr.Interface(
-        fn=analyze,
-        inputs=gr.Image(type="pil", label="음식 사진 업로드"),
-        outputs=[
-            gr.Label(num_top_classes=TOP_K, label="음식 분류 결과"),
-            gr.JSON(label="칼로리 & 영양소 추정"),
-        ],
-        title="🍱 Calorie Counter (LangChain LCEL)",
-        description=(
-            "음식 사진을 업로드하면 HF Inference API로 음식을 인식하고, "
-            "LangChain LCEL 체인이 1인분 기준 칼로리/영양소를 추정합니다. "
-            "결과는 참고용입니다."
-        ),
-        flagging_mode="never",
+# Gemini API 설정
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    raise SystemExit(
+        "GEMINI_API_KEY 환경변수가 비어 있습니다.\n"
+        "HF Space: Settings > Secrets에 GEMINI_API_KEY 등록"
     )
 
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
-# 모듈 레벨 demo (Space/HF 런타임 호환)
-demo = build_ui()
+SYSTEM_PROMPT = """너는 로보틱스·VLA(Vision-Language-Action) 논문 전문가 AI 조교다.
+
+전문 분야:
+- VLA 모델 (OpenVLA, TwinVLA, RT-2, Octo 등)
+- Embodied AI, 로봇 학습 (Imitation Learning, Reinforcement Learning)
+- World Models (DreamerV3, IRIS 등)
+- Diffusion Policy, Action Chunking
+- 로봇 매니퓰레이션, 내비게이션
+
+규칙:
+1. 한국어로 답변한다.
+2. 전문 용어는 영어 원문을 괄호에 병기한다. 예: 모방 학습(Imitation Learning)
+3. 어려운 개념은 직관적 비유를 곁들여 설명한다.
+4. 답변 끝에 관련 논문이 있으면 1~3개 추천한다.
+5. 모르는 내용은 솔직히 "확실하지 않다"고 말한다.
+6. 마크다운 포맷으로 깔끔하게 정리한다.
+
+모드:
+- 사용자가 "용어:" 로 시작하면 → 용어 사전 모드: 정의 + 관련 논문 + 직관적 비유
+- 사용자가 "요약:" 로 시작하면 → 논문 요약 모드: 3줄 요약 + 핵심 기여(contribution)
+- 그 외 → 일반 QA 모드: 질문에 대해 상세 답변
+"""
+
+chat_session = None
+
+def get_chat():
+    global chat_session
+    if chat_session is None:
+        chat_session = model.start_chat(history=[])
+    return chat_session
+
+def respond(message, history):
+    """Gradio ChatInterface 콜백"""
+    if not message.strip():
+        return ""
+    
+    chat = get_chat()
+    
+    # 첫 메시지에 시스템 프롬프트 포함
+    if len(history) == 0:
+        full_message = f"{SYSTEM_PROMPT}\n\n사용자 질문: {message}"
+    else:
+        full_message = message
+    
+    try:
+        response = chat.send_message(full_message)
+        return response.text
+    except Exception as e:
+        return f"⚠️ 오류가 발생했습니다: {str(e)[:200]}"
+
+def clear_chat():
+    global chat_session
+    chat_session = None
+
+# Gradio UI
+demo = gr.ChatInterface(
+    fn=respond,
+    title="🤖 RoboQA — 로보틱스 논문 QA 챗봇",
+    description=(
+        "로보틱스·VLA 논문에 대해 무엇이든 물어보세요!\n\n"
+        "💡 **사용법:**\n"
+        "- 일반 질문: `OpenVLA가 뭐야?`\n"
+        "- 용어 사전: `용어: Action Chunking`\n"
+        "- 논문 요약: `요약: TwinVLA`"
+    ),
+    examples=[
+        "VLA 모델이 뭐야? 쉽게 설명해줘",
+        "용어: Imitation Learning",
+        "요약: TwinVLA",
+        "OpenVLA랑 RT-2 차이가 뭐야?",
+        "Diffusion Policy가 왜 로봇에 좋아?",
+    ],
+    theme=gr.themes.Soft(),
+    retry_btn="🔄 다시 생성",
+    undo_btn="↩️ 되돌리기",
+    clear_btn="🗑️ 대화 초기화",
+)
 
 if __name__ == "__main__":
-    # HF Space에서는 SPACE_ID 환경변수가 설정돼 있어 0.0.0.0 바인딩이 필요하다.
-    # 로컬에서는 127.0.0.1.
     is_space = bool(os.getenv("SPACE_ID"))
     demo.launch(
         server_name="0.0.0.0" if is_space else "127.0.0.1",
