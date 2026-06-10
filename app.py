@@ -18,7 +18,7 @@ if not GEMINI_API_KEY:
     )
 
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = """너는 로보틱스·VLA(Vision-Language-Action) 논문 전문가 AI 조교다.
 
